@@ -14,9 +14,15 @@ string source = File.Exists(sourcePath)
     ? File.ReadAllText(sourcePath)
     : """
       using System;
-      int a = 0;
-      int sum = a + 42;
-      Console.WriteLine(sum);
+      internal static class Program
+      {
+          public static void Main()
+          {
+              int a = 0;
+              int sum = a + 42;
+              Console.WriteLine(sum);
+          }
+      }
       """;
 
 DumpStage("Source Text", () => PrintSourceWithLineNumbers(source));
@@ -35,18 +41,11 @@ DumpStage("Compilation Diagnostics", () => PrintDiagnostics(compilation.GetDiagn
 
 SemanticModel model = compilation.GetSemanticModel(tree);
 
-BinaryExpressionSyntax binary = tree.GetRoot()
-    .DescendantNodes()
-    .OfType<BinaryExpressionSyntax>()
-    .First();
-
-ITypeSymbol? type = model.GetTypeInfo(binary).Type;
 DumpStage(
-    "Semantic Snapshot",
+    "Semantic Analysis",
     () =>
     {
-        Console.WriteLine($"First binary expression: `{binary}`");
-        Console.WriteLine($"Type: {FormatSymbol(type)}");
+        PrintBinaryExpressionSemantics(model, tree.GetRoot());
         PrintDeclaredSymbols(model, tree.GetRoot());
     });
 
@@ -56,7 +55,7 @@ DumpStage(
     "Control Flow Graph",
     () =>
     {
-        if (!TryPrintFirstControlFlowGraph(model, tree.GetRoot(), source, out string reason))
+        if (!TryPrintFirstControlFlowGraph(compilation, tree.GetRoot(), out string reason))
             Console.WriteLine($"(skipped) {reason}");
     });
 
@@ -174,6 +173,37 @@ static void PrintDeclaredSymbols(SemanticModel model, SyntaxNode root)
     }
 }
 
+static void PrintBinaryExpressionSemantics(SemanticModel model, SyntaxNode root)
+{
+    BinaryExpressionSyntax[] binaries = root.DescendantNodes().OfType<BinaryExpressionSyntax>()
+        .ToArray();
+    if (binaries.Length == 0)
+    {
+        Console.WriteLine("(no binary expressions)");
+        return;
+    }
+
+    Console.WriteLine("Binary expressions:");
+    foreach (BinaryExpressionSyntax binary in binaries)
+    {
+        ITypeSymbol? type = model.GetTypeInfo(binary).Type;
+        ITypeSymbol? leftType = model.GetTypeInfo(binary.Left).Type;
+        ITypeSymbol? rightType = model.GetTypeInfo(binary.Right).Type;
+        ISymbol? symbol = model.GetSymbolInfo(binary).Symbol;
+        Optional<object?> constant = model.GetConstantValue(binary);
+        string at = FormatLocation(binary);
+
+        Console.WriteLine($"- {binary.Kind()} `{binary}`{at}");
+        Console.WriteLine($"  type: {FormatSymbol(type)}");
+        Console.WriteLine($"  left: {FormatSymbol(leftType)}");
+        Console.WriteLine($"  right: {FormatSymbol(rightType)}");
+        if (symbol is not null)
+            Console.WriteLine($"  operator: {FormatSymbol(symbol)}");
+        if (constant.HasValue)
+            Console.WriteLine($"  constant: {FormatConstant(constant.Value)}");
+    }
+}
+
 static void PrintOperations(SemanticModel model, SyntaxNode root)
 {
     StatementSyntax[] statements = root.DescendantNodes().OfType<StatementSyntax>().ToArray();
@@ -215,17 +245,23 @@ static void PrintOperation(IOperation operation, string indent, bool isLast)
 }
 
 static bool TryPrintFirstControlFlowGraph(
-    SemanticModel model,
+    CSharpCompilation compilation,
     SyntaxNode root,
-    string source,
     out string reason)
 {
+    if (root.DescendantNodes().OfType<GlobalStatementSyntax>().Any())
+    {
+        reason = "top-level statements are not supported; provide a full program with a method body";
+        return false;
+    }
+
     try
     {
         MethodDeclarationSyntax? method = root.DescendantNodes().OfType<MethodDeclarationSyntax>()
             .FirstOrDefault(m => m.Body is not null);
         if (method is not null)
         {
+            SemanticModel model = compilation.GetSemanticModel(method.SyntaxTree);
             if (model.GetOperation(method) is IMethodBodyOperation methodBodyOperation)
             {
                 reason = "";
@@ -249,79 +285,51 @@ static bool TryPrintFirstControlFlowGraph(
         return false;
     }
 
-    // Fallback: wrap top-level statements in a synthetic Main method so we can show a CFG.
-    var wrappedSource = $$"""
-                          using System;
-                          internal static class __CfgHost
-                          {
-                              public static void Main()
-                              {
-                          {{Indent(source, "        ")}}
-                              }
-                          }
-                          """;
-    SyntaxTree wrappedTree = CSharpSyntaxTree.ParseText(
-        wrappedSource,
-        new CSharpParseOptions(LanguageVersion.Preview));
-    CSharpCompilation wrappedCompilation = CreateCompilation(wrappedTree);
-    SemanticModel wrappedModel = wrappedCompilation.GetSemanticModel(wrappedTree);
-    SyntaxNode wrappedRoot = wrappedTree.GetRoot();
-    MethodDeclarationSyntax? wrappedMain = wrappedRoot.DescendantNodes().OfType<MethodDeclarationSyntax>()
-        .FirstOrDefault(m => m.Identifier.ValueText == "Main");
-    try
-    {
-        if (wrappedMain is not null)
-        {
-            if (wrappedModel.GetOperation(wrappedMain) is IMethodBodyOperation wrappedMethodBodyOperation)
-            {
-                reason = "";
-                Console.WriteLine("(using synthetic wrapper method around top-level statements)");
-                var cfg = ControlFlowGraph.Create(wrappedMethodBodyOperation);
-                PrintControlFlowGraph(cfg);
-                return true;
-            }
-
-            if (wrappedMain.Body is not null &&
-                wrappedModel.GetOperation(wrappedMain.Body) is IBlockOperation wrappedBlock)
-            {
-                reason = "";
-                Console.WriteLine("(using synthetic wrapper method around top-level statements)");
-                var cfg = ControlFlowGraph.Create(wrappedBlock);
-                PrintControlFlowGraph(cfg);
-                return true;
-            }
-        }
-    }
-    catch (Exception ex)
-    {
-        reason = $"failed to build CFG from synthetic wrapper: {ex.GetType().Name}";
-        return false;
-    }
-
     reason = "no block-bodied method found";
     return false;
 }
 
 static void PrintControlFlowGraph(ControlFlowGraph cfg)
 {
+    Dictionary<int, List<int>> predecessors = BuildPredecessorMap(cfg);
     foreach (BasicBlock block in cfg.Blocks)
     {
         Console.WriteLine();
-        Console.WriteLine($"Block {block.Ordinal} ({block.Kind})");
+        Console.WriteLine($"Block B{block.Ordinal} ({block.Kind})");
+        Console.WriteLine($"  predecessors: {FormatBlockList(predecessors[block.Ordinal])}");
 
-        foreach (IOperation operation in block.Operations)
-            Console.WriteLine($"  op: {operation.Kind} [{operation.Syntax.Kind()}]");
+        if (block.Operations.Length == 0)
+        {
+            Console.WriteLine("  operations: (none)");
+        }
+        else
+        {
+            Console.WriteLine("  operations:");
+            foreach (IOperation operation in block.Operations)
+                Console.WriteLine($"    - {FormatOperationSummary(operation)}");
+        }
 
         if (block.BranchValue is not null)
-            Console.WriteLine(
-                $"  branchValue: {block.BranchValue.Kind} [{block.BranchValue.Syntax.Kind()}]");
+            Console.WriteLine($"  branchValue: {FormatOperationSummary(block.BranchValue)}");
 
         if (block.ConditionKind != ControlFlowConditionKind.None)
             Console.WriteLine($"  condition: {block.ConditionKind}");
 
-        PrintSuccessor("fallthrough", block.FallThroughSuccessor);
-        PrintSuccessor("conditional", block.ConditionalSuccessor);
+        PrintSuccessors(block);
     }
+}
+
+static void PrintSuccessors(BasicBlock block)
+{
+    if (block.FallThroughSuccessor is null && block.ConditionalSuccessor is null)
+    {
+        Console.WriteLine("  successors: (none)");
+        return;
+    }
+
+    Console.WriteLine("  successors:");
+    PrintSuccessor("fallthrough", block.FallThroughSuccessor);
+    PrintSuccessor("conditional", block.ConditionalSuccessor);
 }
 
 static void PrintSuccessor(string label, ControlFlowBranch? branch)
@@ -329,8 +337,43 @@ static void PrintSuccessor(string label, ControlFlowBranch? branch)
     if (branch is null)
         return;
 
-    string destination = branch.Destination is null ? "<null>" : branch.Destination.Ordinal.ToString();
-    Console.WriteLine($"  succ({label}) -> {destination}");
+    string destination = branch.Destination is null ? "<null>" : $"B{branch.Destination.Ordinal}";
+    Console.WriteLine($"    - {label} -> {destination}");
+}
+
+static Dictionary<int, List<int>> BuildPredecessorMap(ControlFlowGraph cfg)
+{
+    var map = new Dictionary<int, List<int>>();
+    foreach (BasicBlock block in cfg.Blocks)
+        map[block.Ordinal] = new List<int>();
+
+    foreach (BasicBlock block in cfg.Blocks)
+    {
+        AddPredecessor(map, block.Ordinal, block.FallThroughSuccessor);
+        AddPredecessor(map, block.Ordinal, block.ConditionalSuccessor);
+    }
+
+    return map;
+}
+
+static void AddPredecessor(
+    Dictionary<int, List<int>> map,
+    int sourceOrdinal,
+    ControlFlowBranch? branch)
+{
+    if (branch?.Destination is null)
+        return;
+
+    map[branch.Destination.Ordinal].Add(sourceOrdinal);
+}
+
+static string FormatBlockList(List<int> ordinals)
+{
+    if (ordinals.Count == 0)
+        return "(none)";
+
+    ordinals.Sort();
+    return string.Join(", ", ordinals.Select(o => $"B{o}"));
 }
 
 static string Indent(string text, string indent)
@@ -350,6 +393,51 @@ static string FormatSymbol(ISymbol? symbol)
             SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
             SymbolDisplayGenericsOptions.IncludeTypeParameters,
             miscellaneousOptions: SymbolDisplayMiscellaneousOptions.EscapeKeywordIdentifiers));
+}
+
+static string FormatOperationSummary(IOperation operation)
+{
+    string implicitFlag = operation.IsImplicit ? " (implicit)" : "";
+    string type = operation.Type is null ? "" : $" : {FormatSymbol(operation.Type)}";
+    string constant = operation.ConstantValue.HasValue
+        ? $" = {FormatConstant(operation.ConstantValue.Value)}"
+        : "";
+    string syntax = FormatSyntaxSnippet(operation.Syntax);
+    return $"{operation.Kind}{implicitFlag}{type}{constant} `{syntax}`";
+}
+
+static string FormatSyntaxSnippet(SyntaxNode? node)
+{
+    if (node is null)
+        return "<no-syntax>";
+
+    var text = node.ToString();
+    text = string.Join(
+        " ",
+        text.Split(
+            new[] { ' ', '\r', '\n', '\t' },
+            StringSplitOptions.RemoveEmptyEntries));
+    if (text.Length > 80)
+        text = text.Substring(0, 77) + "...";
+    return text;
+}
+
+static string FormatLocation(SyntaxNode node)
+{
+    FileLinePositionSpan span = node.GetLocation().GetLineSpan();
+    LinePosition start = span.StartLinePosition;
+    return $" @ L{start.Line + 1}:{start.Character + 1}";
+}
+
+static string FormatConstant(object? value)
+{
+    if (value is null)
+        return "null";
+
+    if (value is string s)
+        return $"\"{s.Replace("\\", "\\\\").Replace("\"", "\\\"")}\"";
+
+    return value.ToString() ?? "null";
 }
 
 static void EmitAndDisassemble(CSharpCompilation compilation)
