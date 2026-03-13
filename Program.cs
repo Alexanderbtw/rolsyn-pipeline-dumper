@@ -27,7 +27,7 @@ string source = File.Exists(sourcePath)
 
 DumpStage("Source Text", () => PrintSourceWithLineNumbers(source));
 
-var parseOptions = new CSharpParseOptions(LanguageVersion.Preview, kind: SourceCodeKind.Regular);
+var parseOptions = new CSharpParseOptions(LanguageVersion.CSharp14, kind: SourceCodeKind.Regular);
 SyntaxTree tree = CSharpSyntaxTree.ParseText(source, parseOptions);
 
 Console.WriteLine("AST:");
